@@ -573,11 +573,7 @@ pub struct TelegramChannel {
     /// Pre-computed tool command specs (name, description) for bot command registration.
     tool_command_specs: Vec<(String, String)>,
     /// pending approval requests: callback_data key → pending approval
-    pending_approvals: Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<String, PendingApproval>,
-        >,
-    >,
+    pending_approvals: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
     /// Seconds to wait for the operator to tap an inline-keyboard button on a
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
@@ -3363,9 +3359,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                         {
                             ::zeroclaw_log::record!(
                                 WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"status": status.to_string()})),
                                 "editMessageText (approval resolution) failed"
                             );
                         }
@@ -8452,7 +8451,10 @@ mod tests {
 
         // simulate what listen() does when a callback_query arrives
         if let Some(pending) = ch.pending_approvals.lock().await.remove(&approval_id) {
-            pending.sender.send(ChannelApprovalResponse::Approve).unwrap();
+            pending
+                .sender
+                .send(ChannelApprovalResponse::Approve)
+                .unwrap();
         }
 
         let result = rx.await.unwrap();

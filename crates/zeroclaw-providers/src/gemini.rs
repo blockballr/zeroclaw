@@ -1103,7 +1103,10 @@ impl GeminiModelProvider {
         // history ending on the model's own output, so drop the trailing model
         // turns. The last surviving turn must be a user turn, or a bare request
         // falls back to a user placeholder.
-        while contents.last().is_some_and(|c| c.role.as_deref() == Some("model")) {
+        while contents
+            .last()
+            .is_some_and(|c| c.role.as_deref() == Some("model"))
+        {
             contents.pop();
         }
         if contents.is_empty() {
