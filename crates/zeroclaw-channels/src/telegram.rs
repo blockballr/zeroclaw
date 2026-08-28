@@ -3585,11 +3585,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or("Operator");
 
             if let (Some(chat_id), Some(message_id)) = (chat_id, message_id) {
+                // an InlineKeyboardMarkup with zero rows is the Bot API's
+                // documented way to drop the buttons; a bare {} is not a
+                // valid markup object (inline_keyboard is a required field)
                 let edit_body = serde_json::json!({
                     "chat_id": chat_id,
                     "message_id": message_id,
                     "text": format!("{} by {}: {}", answer_text, user_first_name, tool_name),
-                    "reply_markup": {},
+                    "reply_markup": { "inline_keyboard": [] },
                 });
                 match self
                     .http_client()
@@ -10170,7 +10173,15 @@ mod tests {
         assert_eq!(body["message_id"], 99);
         let approved = i18n::get_required_cli_string("channel-telegram-approval-ack-approved");
         assert_eq!(body["text"], format!("✅ {approved} by Alice: shell"));
-        assert_eq!(body["reply_markup"], serde_json::json!({}));
+        // the keyboard must be removed with a valid InlineKeyboardMarkup
+        // (inline_keyboard is a required field); a bare {} payload would be
+        // rejected by the Bot API and leave the stale buttons live
+        assert_eq!(
+            body["reply_markup"],
+            serde_json::json!({ "inline_keyboard": [] })
+        );
+        let rows = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
+        assert!(rows.is_empty());
     }
 
     #[tokio::test]
