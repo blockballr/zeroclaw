@@ -1508,16 +1508,21 @@ impl TelegramChannel {
     async fn classify_edit_message_response(resp: reqwest::Response) -> EditMessageResult {
         let status = resp.status();
         if status.is_success() {
-            // the Bot API puts the real outcome in the envelope: an HTTP-200
-            // response whose body says ok:false is still an unsuccessful
-            // request, so it must not be reported as a successful edit
+            // the Bot API envelope is the outcome: only an explicit boolean
+            // ok:true makes a 2xx a successful edit. A truncated body, a
+            // proxy-generated 200, a missing or non-boolean ok field would
+            // otherwise silently report a card rewrite that never happened.
             let bytes = resp.bytes().await.unwrap_or_default();
-            let envelope: serde_json::Value =
-                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-            match envelope.get("ok").and_then(|ok| ok.as_bool()) {
+            let envelope = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+            let ok = envelope
+                .as_ref()
+                .and_then(|v| v.get("ok").and_then(|b| b.as_bool()));
+            match ok {
+                Some(true) => return EditMessageResult::Success,
                 Some(false) => {
                     let description = envelope
-                        .get("description")
+                        .as_ref()
+                        .and_then(|v| v.get("description"))
                         .and_then(|d| d.as_str())
                         .unwrap_or_default();
                     if description.contains("message is not modified") {
@@ -1525,9 +1530,8 @@ impl TelegramChannel {
                     }
                     return EditMessageResult::Failed(status);
                 }
-                // a 200 body with no parseable ok field stays legacy-success
-                // so non-standard servers and local mocks keep working
-                _ => return EditMessageResult::Success,
+                // missing field, wrong type, unparseable body, read failure
+                None => return EditMessageResult::Failed(status),
             }
         }
 
@@ -10246,7 +10250,7 @@ mod tests {
 
         let callback = serde_json::json!({
             "id": "cb-1",
-            "from": { "first_name": "Alice" },
+            "from": { "first_name": "zeroclaw_operator" },
             "message": { "message_id": 99, "chat": { "id": 12345 } },
             "data": format!("approval:{approval_id}:approve"),
         });
@@ -10263,7 +10267,10 @@ mod tests {
         assert_eq!(body["chat_id"], 12345);
         assert_eq!(body["message_id"], 99);
         let approved = i18n::get_required_cli_string("channel-telegram-approval-ack-approved");
-        assert_eq!(body["text"], format!("✅ {approved} by Alice: shell"));
+        assert_eq!(
+            body["text"],
+            format!("✅ {approved} by zeroclaw_operator: shell")
+        );
         // the keyboard must be removed with a valid InlineKeyboardMarkup
         // (inline_keyboard is a required field); a bare {} payload would be
         // rejected by the Bot API and leave the stale buttons live
@@ -10386,6 +10393,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_envelope_without_ok_field_is_classified_failed() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/edit$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "message_id": 1 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri());
+
+        let resp = ch
+            .http_client()
+            .post(ch.api_url("edit"))
+            .send()
+            .await
+            .unwrap();
+        let classified = TelegramChannel::classify_edit_message_response(resp).await;
+        assert_eq!(
+            classified,
+            EditMessageResult::Failed(reqwest::StatusCode::OK)
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_envelope_malformed_body_is_classified_failed() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/edit$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(b"truncated 200 {\"ok\":", "text/plain"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri());
+
+        let resp = ch
+            .http_client()
+            .post(ch.api_url("edit"))
+            .send()
+            .await
+            .unwrap();
+        let classified = TelegramChannel::classify_edit_message_response(resp).await;
+        assert_eq!(
+            classified,
+            EditMessageResult::Failed(reqwest::StatusCode::OK)
+        );
+    }
+
+    #[tokio::test]
     async fn process_update_routes_callback_to_single_edit_and_advances_offset() {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -10437,7 +10518,7 @@ mod tests {
             "update_id": 41,
             "callback_query": {
                 "id": "cb-route-1",
-                "from": { "first_name": "Alice" },
+                "from": { "first_name": "zeroclaw_operator" },
                 "message": { "message_id": 77, "chat": { "id": 12345 } },
                 "data": format!("approval:{approval_id}:approve"),
             }
@@ -10543,7 +10624,7 @@ mod tests {
 
         let callback = serde_json::json!({
             "id": "cb-late",
-            "from": { "first_name": "Alice" },
+            "from": { "first_name": "zeroclaw_operator" },
             "message": { "message_id": 55, "chat": { "id": 12345 } },
             "data": format!("approval:{approval_id}:approve"),
         });
@@ -10627,7 +10708,7 @@ mod tests {
 
         let callback = serde_json::json!({
             "id": "cb-early",
-            "from": { "first_name": "Alice" },
+            "from": { "first_name": "zeroclaw_operator" },
             "message": { "message_id": 66, "chat": { "id": 12345 } },
             "data": format!("approval:{approval_id}:approve"),
         });
@@ -10645,7 +10726,10 @@ mod tests {
         assert!(requests[2].url.path().ends_with("/editMessageText"));
         let edit_body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
         let approved = i18n::get_required_cli_string("channel-telegram-approval-ack-approved");
-        assert_eq!(edit_body["text"], format!("✅ {approved} by Alice: shell"));
+        assert_eq!(
+            edit_body["text"],
+            format!("✅ {approved} by zeroclaw_operator: shell")
+        );
         assert_eq!(
             edit_body["reply_markup"],
             serde_json::json!({ "inline_keyboard": [] })
