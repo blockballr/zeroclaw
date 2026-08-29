@@ -1506,11 +1506,31 @@ impl TelegramChannel {
     }
 
     async fn classify_edit_message_response(resp: reqwest::Response) -> EditMessageResult {
-        if resp.status().is_success() {
-            return EditMessageResult::Success;
+        let status = resp.status();
+        if status.is_success() {
+            // the Bot API puts the real outcome in the envelope: an HTTP-200
+            // response whose body says ok:false is still an unsuccessful
+            // request, so it must not be reported as a successful edit
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            match envelope.get("ok").and_then(|ok| ok.as_bool()) {
+                Some(false) => {
+                    let description = envelope
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or_default();
+                    if description.contains("message is not modified") {
+                        return EditMessageResult::NotModified;
+                    }
+                    return EditMessageResult::Failed(status);
+                }
+                // a 200 body with no parseable ok field stays legacy-success
+                // so non-standard servers and local mocks keep working
+                _ => return EditMessageResult::Success,
+            }
         }
 
-        let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if body.contains("message is not modified") {
             return EditMessageResult::NotModified;
@@ -10182,6 +10202,196 @@ mod tests {
         );
         let rows = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn edit_envelope_ok_false_is_classified_failed() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/edit$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: message to edit not found"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri());
+
+        let resp = ch
+            .http_client()
+            .post(ch.api_url("edit"))
+            .send()
+            .await
+            .unwrap();
+        let classified = TelegramChannel::classify_edit_message_response(resp).await;
+        assert_eq!(
+            classified,
+            EditMessageResult::Failed(reqwest::StatusCode::OK)
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_envelope_ok_false_not_modified_is_classified_not_modified() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/edit$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: message is not modified"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri());
+
+        let resp = ch
+            .http_client()
+            .post(ch.api_url("edit"))
+            .send()
+            .await
+            .unwrap();
+        let classified = TelegramChannel::classify_edit_message_response(resp).await;
+        assert_eq!(classified, EditMessageResult::NotModified);
+    }
+
+    #[tokio::test]
+    async fn edit_envelope_ok_true_is_classified_success() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/edit$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri());
+
+        let resp = ch
+            .http_client()
+            .post(ch.api_url("edit"))
+            .send()
+            .await
+            .unwrap();
+        let classified = TelegramChannel::classify_edit_message_response(resp).await;
+        assert_eq!(classified, EditMessageResult::Success);
+    }
+
+    #[tokio::test]
+    async fn process_update_routes_callback_to_single_edit_and_advances_offset() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 77 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri());
+
+        let approval_id = "cb-route-1".to_string();
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: resp_tx,
+                tool_name: "shell".to_string(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let mut offset = 0i64;
+        let mut transient_retry = None;
+        let update = serde_json::json!({
+            "update_id": 41,
+            "callback_query": {
+                "id": "cb-route-1",
+                "from": { "first_name": "Alice" },
+                "message": { "message_id": 77, "chat": { "id": 12345 } },
+                "data": format!("approval:{approval_id}:approve"),
+            }
+        });
+
+        let outcome = ch
+            .process_update(&update, &tx, &mut offset, &mut transient_retry)
+            .await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        assert_eq!(offset, 42);
+        assert_eq!(resp_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(
+            rx.try_recv().is_err(),
+            "a callback_query is terminal: no downstream message may be delivered"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].url.path().ends_with("/answerCallbackQuery"));
+        assert!(requests[1].url.path().ends_with("/editMessageText"));
+        let edit_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            edit_body["reply_markup"],
+            serde_json::json!({ "inline_keyboard": [] })
+        );
     }
 
     #[tokio::test]
