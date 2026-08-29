@@ -1539,6 +1539,44 @@ impl TelegramChannel {
         EditMessageResult::Failed(status)
     }
 
+    /// Shortest window a deadline-firing waiter waits for a callback that
+    /// claimed the resolution first. The callback sends immediately after
+    /// claiming, so this only needs to cover the task-scheduling gap.
+    const CALLBACK_CLAIM_GRACE: Duration = Duration::from_secs(5);
+
+    /// Decide the approval outcome after the wait deadline has fired. The
+    /// pending entry is the single resolution claim: winning its removal
+    /// makes the runtime's timed-out deny the outcome, while losing the
+    /// claim means a callback claimed first and its response is in flight
+    /// on the channel, so it is consumed here instead of overridden.
+    async fn resolve_after_deadline(
+        &self,
+        approval_id: &str,
+        rx: &mut tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
+    ) -> zeroclaw_api::channel::AttributedApprovalResponse {
+        let claimed = self
+            .pending_approvals
+            .lock()
+            .await
+            .remove(approval_id)
+            .is_some();
+        if claimed {
+            return zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                zeroclaw_api::channel::ApprovalSource::TimedOut,
+            );
+        }
+        match tokio::time::timeout(Self::CALLBACK_CLAIM_GRACE, rx).await {
+            Ok(Ok(response)) => {
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+            }
+            _ => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                zeroclaw_api::channel::ApprovalSource::TimedOut,
+            ),
+        }
+    }
+
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
         let resp = self.http_client().get(self.api_url("getMe")).send().await?;
 
@@ -3538,34 +3576,71 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        // keep the tool name so the prompt can be rewritten below
-        let resolved_tool = if let Some(resp) = response
-            && let Some(pending) = self.pending_approvals.lock().await.remove(approval_id)
-        {
-            let _ = pending.sender.send(resp);
-            Some(pending.tool_name)
+        // The pending entry is the single resolution claim: removing it wins
+        // the right to decide, and a won claim is only published when the
+        // response actually reaches the waiter on the channel. A lost claim
+        // or a failed send gets an honest already-resolved toast and no card
+        // rewrite, so Telegram can never show an outcome the runtime did not
+        // record.
+        let has_response = response.is_some();
+        let resolved_tool = if let Some(resp) = response {
+            match self.pending_approvals.lock().await.remove(approval_id) {
+                Some(pending) => match pending.sender.send(resp) {
+                    Ok(()) => Some(pending.tool_name),
+                    Err(_) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "approval_id":
+                                    zeroclaw_runtime::security::scrub(approval_id)
+                            })),
+                            "approval callback lost the resolution race; card left untouched"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            }
         } else {
             None
         };
 
-        // dismiss the client spinner
-        let answer_text = match action {
-            "approve" => format!(
-                "✅ {}",
-                i18n::get_required_cli_string("channel-telegram-approval-ack-approved")
-            ),
-            "always" => format!(
-                "✅✅ {}",
-                i18n::get_required_cli_string("channel-telegram-approval-ack-always-approved")
-            ),
-            "deny" => format!(
-                "❌ {}",
-                i18n::get_required_cli_string("channel-telegram-approval-ack-denied")
-            ),
-            _ => format!(
+        // dismiss the client spinner: a won claim acknowledges the tapped
+        // action, anything else gets the already-resolved toast
+        let answer_text = if resolved_tool.is_some() {
+            match action {
+                "approve" => format!(
+                    "✅ {}",
+                    i18n::get_required_cli_string("channel-telegram-approval-ack-approved")
+                ),
+                "always" => format!(
+                    "✅✅ {}",
+                    i18n::get_required_cli_string("channel-telegram-approval-ack-always-approved")
+                ),
+                "deny" => format!(
+                    "❌ {}",
+                    i18n::get_required_cli_string("channel-telegram-approval-ack-denied")
+                ),
+                _ => format!(
+                    "⚠️ {}",
+                    i18n::get_required_cli_string("channel-telegram-approval-ack-unknown")
+                ),
+            }
+        } else if has_response {
+            format!(
+                "⏳ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-already-resolved")
+            )
+        } else {
+            format!(
                 "⚠️ {}",
                 i18n::get_required_cli_string("channel-telegram-approval-ack-unknown")
-            ),
+            )
         };
         let answer_body = serde_json::json!({
             "callback_query_id": cb_id,
@@ -4608,7 +4683,7 @@ Ensure only one `zeroclaw` process is using this bot token."
 
         // Register the oneshot BEFORE sending the message to avoid a race
         // where the user taps the button before the sender is in the map.
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
         self.pending_approvals.lock().await.insert(
             approval_id.clone(),
             PendingApproval {
@@ -4686,9 +4761,17 @@ Ensure only one `zeroclaw` process is using this bot token."
         }
 
         // Wait for the user to tap a button. Timeout is configurable via
-        // `channels.telegram.approval_timeout_secs` (default 120s).
+        // `channels.telegram.approval_timeout_secs` (default 120s). The
+        // pending entry is the single resolution claim: exactly one side
+        // removes it, and that side decides. When the deadline fires the
+        // waiter claims the entry and denies; if a callback already claimed
+        // it, the operator's response is in flight on the channel and is
+        // consumed instead of overridden, so the published card can never
+        // disagree with the runtime's recorded outcome.
         let result =
-            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), &mut rx)
+                .await
+            {
                 Ok(Ok(response)) => Some(
                     zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
                 ),
@@ -4702,17 +4785,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                         ),
                     )
                 }
-                Err(_) => {
-                    // Timeout — clean up and deny. This is the runtime's deny,
-                    // not the operator's.
-                    self.pending_approvals.lock().await.remove(&approval_id);
-                    Some(
-                        zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                            ChannelApprovalResponse::Deny,
-                            zeroclaw_api::channel::ApprovalSource::TimedOut,
-                        ),
-                    )
-                }
+                Err(_) => Some(self.resolve_after_deadline(&approval_id, &mut rx).await),
             };
 
         Ok(result)
@@ -8175,20 +8248,15 @@ mod tests {
 
         // Rebuild the expectation through the catalogue, not from literals:
         // a wiring regression that stops calling i18n, or a typo'd key,
-        // changes this and fails the assertion.
+        // changes this and fails the assertion. These callbacks carry no
+        // pending entry, so every valid action gets the already-resolved
+        // toast and only the unknown action gets its own arm; the won-claim
+        // action acks are pinned by callback_wins_claim and the scanner.
+        let stale = i18n::get_required_cli_string("channel-telegram-approval-ack-already-resolved");
         let expected = vec![
-            format!(
-                "✅ {}",
-                i18n::get_required_cli_string("channel-telegram-approval-ack-approved")
-            ),
-            format!(
-                "✅✅ {}",
-                i18n::get_required_cli_string("channel-telegram-approval-ack-always-approved")
-            ),
-            format!(
-                "❌ {}",
-                i18n::get_required_cli_string("channel-telegram-approval-ack-denied")
-            ),
+            format!("⏳ {stale}"),
+            format!("⏳ {stale}"),
+            format!("⏳ {stale}"),
             format!(
                 "⚠️ {}",
                 i18n::get_required_cli_string("channel-telegram-approval-ack-unknown")
@@ -8211,8 +8279,8 @@ mod tests {
     fn callback_ack_source_region() -> &'static str {
         const SRC: &str = include_str!("telegram.rs");
         let start = SRC
-            .find("let answer_text = match action {")
-            .expect("callback ack arm: `let answer_text = match action {` not found");
+            .find("let answer_text = if resolved_tool.is_some() {")
+            .expect("callback ack arm: `let answer_text = if resolved_tool.is_some() {` not found");
         let rest = &SRC[start..];
         let end = rest
             .find("let answer_body")
@@ -8244,6 +8312,7 @@ mod tests {
             "channel-telegram-approval-ack-always-approved",
             "channel-telegram-approval-ack-denied",
             "channel-telegram-approval-ack-unknown",
+            "channel-telegram-approval-ack-already-resolved",
         ] {
             assert!(
                 region.contains(&format!(
@@ -8253,11 +8322,13 @@ mod tests {
             );
         }
 
-        // Exactly four arms, exactly four lookups: an arm added or converted
-        // to a literal breaks this.
+        // Exactly six lookups across the five arms: the four action acks,
+        // the already-resolved toast, and the unknown-action fallback that
+        // serves both the won-branch fallthrough and the no-response case.
+        // An arm added or converted to a literal breaks this.
         assert_eq!(
             region.matches("i18n::get_required_cli_string").count(),
-            4,
+            6,
             "every arm of the ack match must resolve through the Fluent catalogue"
         );
 
@@ -10391,6 +10462,252 @@ mod tests {
         assert_eq!(
             edit_body["reply_markup"],
             serde_json::json!({ "inline_keyboard": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_wins_claim_and_late_callback_is_a_stale_no_edit() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 55 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        // the runtime already denied on the timeout, so a late tap must not
+        // rewrite the card
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+        };
+        let attributed = ch
+            .request_approval_attributed("12345", &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attributed.response,
+            zeroclaw_api::channel::ChannelApprovalResponse::Deny
+        );
+
+        // the operator's tap arrives after the runtime already denied: the
+        // card must stay untouched and the toast must be honest
+        let requests = mock_server.received_requests().await.unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let cb_data = sent["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let approval_id = cb_data
+            .strip_prefix("approval:")
+            .unwrap()
+            .split(':')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let callback = serde_json::json!({
+            "id": "cb-late",
+            "from": { "first_name": "Alice" },
+            "message": { "message_id": 55, "chat": { "id": 12345 } },
+            "data": format!("approval:{approval_id}:approve"),
+        });
+        ch.handle_approval_callback(&callback).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "no editMessageText may be sent");
+        let toast: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let stale = i18n::get_required_cli_string("channel-telegram-approval-ack-already-resolved");
+        assert_eq!(toast["text"], format!("⏳ {stale}"));
+    }
+
+    #[tokio::test]
+    async fn callback_wins_claim_and_runtime_honors_operator_response() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 66 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 66 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                mention_only,
+            )
+            .with_api_base(mock_server.uri())
+            .with_approval_timeout_secs(120),
+        );
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+        };
+        let waiter = {
+            let ch = Arc::clone(&ch);
+            zeroclaw_spawn::spawn!(async move {
+                ch.request_approval_attributed("12345", &request).await
+            })
+        };
+
+        let approval_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = ch.pending_approvals.lock().await.keys().next().cloned() {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("approval entry must be registered");
+
+        let callback = serde_json::json!({
+            "id": "cb-early",
+            "from": { "first_name": "Alice" },
+            "message": { "message_id": 66, "chat": { "id": 12345 } },
+            "data": format!("approval:{approval_id}:approve"),
+        });
+        ch.handle_approval_callback(&callback).await;
+
+        let attributed = waiter.await.unwrap().unwrap().unwrap();
+        assert_eq!(
+            attributed.response,
+            zeroclaw_api::channel::ChannelApprovalResponse::Approve
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].url.path().ends_with("/answerCallbackQuery"));
+        assert!(requests[2].url.path().ends_with("/editMessageText"));
+        let edit_body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+        let approved = i18n::get_required_cli_string("channel-telegram-approval-ack-approved");
+        assert_eq!(edit_body["text"], format!("✅ {approved} by Alice: shell"));
+        assert_eq!(
+            edit_body["reply_markup"],
+            serde_json::json!({ "inline_keyboard": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_resolver_loses_claim_and_consumes_callback_response() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "a1".to_string(),
+            PendingApproval {
+                sender: tx,
+                tool_name: "shell".to_string(),
+            },
+        );
+        // the callback claims the entry first and its response is already in
+        // flight on the channel when the deadline fires
+        let pending = ch.pending_approvals.lock().await.remove("a1").unwrap();
+        let _ = pending.sender.send(ChannelApprovalResponse::Approve);
+
+        let outcome = ch.resolve_after_deadline("a1", &mut rx).await;
+        assert_eq!(outcome.response, ChannelApprovalResponse::Approve);
+        assert!(ch.pending_approvals.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deadline_resolver_wins_claim_and_denies() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "a2".to_string(),
+            PendingApproval {
+                sender: tx,
+                tool_name: "shell".to_string(),
+            },
+        );
+
+        let outcome = ch.resolve_after_deadline("a2", &mut rx).await;
+        assert_eq!(outcome.response, ChannelApprovalResponse::Deny);
+        assert!(
+            ch.pending_approvals.lock().await.is_empty(),
+            "the winning claim removes the entry"
         );
     }
 
